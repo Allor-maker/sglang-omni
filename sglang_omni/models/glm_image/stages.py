@@ -86,16 +86,27 @@ def _bootstrap(model_path: str):
 # ===== payload <-> Req conversion =====
 
 
-def _to_req(state: GLMImageState) -> Req:
-    """Build the sglang request a wrapped stage expects from omni state."""
+def _to_req(
+    state: GLMImageState,
+    *,
+    num_inference_steps: int = C.DEFAULT_NUM_INFERENCE_STEPS,
+    guidance_scale: float = C.DEFAULT_GUIDANCE_SCALE,
+) -> Req:
+    """Build the sglang request a wrapped stage expects from omni state.
+
+    Zero means "the request did not ask", so the stage's own default wins.
+    GlmImageSamplingParams refuses a non-positive step count outright, and
+    validate() derives do_classifier_free_guidance from the scale, so both
+    have to be real values by the time the Req is built.
+    """
     sampling_params = GlmImageSamplingParams(
         prompt=state.prompt,
         width=state.width or None,
         height=state.height or None,
         seed=state.seed if state.seed is not None else 42,
         num_outputs_per_prompt=state.num_outputs,
-        num_inference_steps=state.num_inference_steps,
-        guidance_scale=state.guidance_scale,
+        num_inference_steps=state.num_inference_steps or num_inference_steps,
+        guidance_scale=state.guidance_scale or guidance_scale,
     )
     req = Req(sampling_params=sampling_params)
     # Fields the earlier stages already produced. Req delegates unknown names
@@ -140,13 +151,17 @@ def _from_req(req: Req, state: GLMImageState) -> GLMImageState:
     return state
 
 
-def _run(stage, server_args):
-    """Wrap one sglang stage as an omni compute function."""
+def _run(stage, server_args, **req_defaults):
+    """Wrap one sglang stage as an omni compute function.
+
+    ``req_defaults`` carries the stage's FactoryArgs knobs into the Req, which
+    is where the wrapped sglang logic reads them from.
+    """
 
     @torch.inference_mode()
     def compute(payload):
         state = load_state(payload, GLMImageState)
-        req = stage.forward(_to_req(state), server_args)
+        req = stage.forward(_to_req(state, **req_defaults), server_args)
         return store_state(payload, _from_req(req, state))
 
     return compute
@@ -226,11 +241,14 @@ def create_before_denoising_executor(
         transformer=transformer,
         scheduler=scheduler,
     )
-    # TODO(you): max_sequence_length and num_inference_steps are hardcoded
-    # inside the stage (lines 1176 and batch.num_inference_steps); decide
-    # whether to set them on the Req or to override the stage method.
-    del max_sequence_length, num_inference_steps
-    return SimpleScheduler(_run(stage, server_args), max_concurrency=max_concurrency)
+    # TODO(you): max_sequence_length is hardcoded at 1024 inside the stage
+    # (line 1176) with no way in through the Req; overriding it means
+    # subclassing the stage and reimplementing forward.
+    del max_sequence_length
+    return SimpleScheduler(
+        _run(stage, server_args, num_inference_steps=num_inference_steps),
+        max_concurrency=max_concurrency,
+    )
 
 
 def create_denoising_executor(
@@ -259,8 +277,10 @@ def create_denoising_executor(
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(paths.scheduler))
 
     stage = DenoisingStage(transformer=transformer, scheduler=scheduler)
-    del guidance_scale  # TODO(you): carry it on the Req, not on the stage.
-    return SimpleScheduler(_run(stage, server_args), max_concurrency=max_concurrency)
+    return SimpleScheduler(
+        _run(stage, server_args, guidance_scale=guidance_scale),
+        max_concurrency=max_concurrency,
+    )
 
 
 def create_decode_executor(
