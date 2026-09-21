@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AuK: instruction-driven speech generation and editing."""
+"""GLM-Image: instruction-driven image generation and editing."""
 
 from sglang_omni.models.model_capabilities import ModelCapabilities
 
