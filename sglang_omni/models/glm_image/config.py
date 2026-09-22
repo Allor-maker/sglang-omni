@@ -38,7 +38,6 @@ class GLMImagePipelineConfig(PipelineConfig):
             factory=FactoryArgs(
                 device=current_platform.device_type,
                 dtype="bfloat16",
-                max_sequence_length=C.MAX_SEQUENCE_LENGTH,
                 num_inference_steps=C.DEFAULT_NUM_INFERENCE_STEPS,
                 max_concurrency=1,
             ),

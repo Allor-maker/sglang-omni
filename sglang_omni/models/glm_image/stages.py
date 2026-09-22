@@ -5,14 +5,15 @@ Each factory wraps the matching sglang stage: the model modules are loaded
 with ``from_pretrained`` here, sglang's stage object holds the logic, and the
 omni payload is converted to a sglang ``Req`` and back around every call.
 
-PROTOTYPE: the conversion helpers and the terminal payload are marked TODO
-where the contract still has to be established by running it.
+Text-to-image only. The image-conditioned path additionally runs the DiT to
+fill a reference KV cache, which the payload cannot carry between stages.
 """
 
 from __future__ import annotations
 
 import logging
 from functools import lru_cache
+from types import SimpleNamespace
 
 import torch
 
@@ -81,6 +82,23 @@ def _bootstrap(model_path: str):
     server_args.pipeline_config = pipeline_config
     set_global_server_args(server_args)
     return paths, config, server_args
+
+
+class _TransformerConfigView:
+    """The DiT's config for a stage that reads it but never calls the module.
+
+    T2I conditioning only reads in_channels, num_layers and patch_size off the
+    transformer; I2I also runs it to fill the reference KV cache (upstream
+    stage lines 1305-1334) and needs the real module instead.
+    """
+
+    def __init__(self, transformer_config: dict, dtype: torch.dtype):
+        # hasattr(config, "sample_size") must stay False: upstream falls back
+        # to 128, and GLM-Image checkpoints do not ship the key.
+        self.config = SimpleNamespace(
+            **{k: v for k, v in transformer_config.items() if not k.startswith("_")}
+        )
+        self.dtype = dtype
 
 
 # ===== payload <-> Req conversion =====
@@ -203,7 +221,6 @@ def create_before_denoising_executor(
     device: str | None = None,
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
-    max_sequence_length: int = C.MAX_SEQUENCE_LENGTH,
     num_inference_steps: int = C.DEFAULT_NUM_INFERENCE_STEPS,
     max_concurrency: int = 1,
 ) -> SimpleScheduler:
@@ -213,7 +230,7 @@ def create_before_denoising_executor(
 
     torch_dtype = _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
-    paths, _, server_args = _bootstrap(model_path)
+    paths, config, server_args = _bootstrap(model_path)
 
     tokenizer = AutoTokenizer.from_pretrained(str(paths.tokenizer))
     text_encoder = (
@@ -228,23 +245,14 @@ def create_before_denoising_executor(
     )
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(paths.scheduler))
 
-    # TODO(you): the stage reads self.transformer.config.{in_channels,num_layers,
-    # patch_size} at forward time. Passing the real DiT here would pin a second
-    # copy of it in this process; decide between a lightweight config-only shim
-    # and colocating this stage with denoising.
-    transformer = None
-
     stage = GlmImageBeforeDenoisingStage(
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         vae=vae,
-        transformer=transformer,
+        transformer=_TransformerConfigView(config.transformer, torch_dtype),
         scheduler=scheduler,
     )
-    # TODO(you): max_sequence_length is hardcoded at 1024 inside the stage
-    # (line 1176) with no way in through the Req; overriding it means
-    # subclassing the stage and reimplementing forward.
-    del max_sequence_length
+
     return SimpleScheduler(
         _run(stage, server_args, num_inference_steps=num_inference_steps),
         max_concurrency=max_concurrency,

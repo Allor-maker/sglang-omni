@@ -49,7 +49,6 @@ def resolve_checkpoint(model_path: str | Path) -> CheckpointPaths:
         model_index=root / "model_index.json"
     )
 
-    
     return paths
 
 def load_json(path: Path) -> dict[str, Any]:
