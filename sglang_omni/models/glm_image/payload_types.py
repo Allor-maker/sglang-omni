@@ -20,8 +20,7 @@ class GLMImageState(DeclarativeStateBase):
 
     # --- request parameters ---
     prompt: str = wire("", codec="str")
-    # Aligned to the D32 grid by the AR stage; requested_* keeps the user's
-    # canvas so the decode stage can crop back to it.
+
     width: int = wire(0, codec="int")
     height: int = wire(0, codec="int")
     requested_width: int = wire(0, codec="int")

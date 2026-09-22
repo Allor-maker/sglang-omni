@@ -84,6 +84,20 @@ def _bootstrap(model_path: str):
     return paths, config, server_args
 
 
+@lru_cache(maxsize=None)
+def _load_scheduler(scheduler_path: str):
+    """One scheduler instance shared by conditioning and denoising.
+
+    Conditioning configures the sigma schedule on it (resolution-dependent mu)
+    and denoising reads it back off the Req, so a second instance would sample
+    on an unconfigured schedule. Its step index is mutable state, which holds
+    only while both stages stay at max_concurrency=1 in one process.
+    """
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    return FlowMatchEulerDiscreteScheduler.from_pretrained(scheduler_path)
+
+
 class _TransformerConfigView:
     """The DiT's config for a stage that reads it but never calls the module.
 
@@ -179,8 +193,13 @@ def _run(stage, server_args, **req_defaults):
     @torch.inference_mode()
     def compute(payload):
         state = load_state(payload, GLMImageState)
-        req = stage.forward(_to_req(state, **req_defaults), server_args)
-        return store_state(payload, _from_req(req, state))
+        req = _to_req(state, **req_defaults)
+        # DenoisingStage reads batch.scheduler, not self.scheduler, and the
+        # instance carries the schedule conditioning configured on it.
+        scheduler = getattr(stage, "scheduler", None)
+        if scheduler is not None:
+            req.scheduler = scheduler
+        return store_state(payload, _from_req(stage.forward(req, server_args), state))
 
     return compute
 
@@ -225,7 +244,7 @@ def create_before_denoising_executor(
     max_concurrency: int = 1,
 ) -> SimpleScheduler:
     """Conditioning stage: ByT5 glyph embeds, initial noise, timestep schedule."""
-    from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
+    from diffusers import AutoencoderKL
     from transformers import AutoTokenizer, T5EncoderModel
 
     torch_dtype = _resolve_dtype(field="dtype", name=dtype)
@@ -243,7 +262,7 @@ def create_before_denoising_executor(
         .to(device)
         .eval()
     )
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(paths.scheduler))
+    scheduler = _load_scheduler(str(paths.scheduler))
 
     stage = GlmImageBeforeDenoisingStage(
         tokenizer=tokenizer,
@@ -269,7 +288,7 @@ def create_denoising_executor(
     max_concurrency: int = 1,
 ) -> SimpleScheduler:
     """Denoising stage: the DiT sampling loop with classifier-free guidance."""
-    from diffusers import FlowMatchEulerDiscreteScheduler, GlmImageTransformer2DModel
+    from diffusers import GlmImageTransformer2DModel
 
     torch_dtype = _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
@@ -282,7 +301,7 @@ def create_denoising_executor(
         .to(device)
         .eval()
     )
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(paths.scheduler))
+    scheduler = _load_scheduler(str(paths.scheduler))
 
     stage = DenoisingStage(transformer=transformer, scheduler=scheduler)
     return SimpleScheduler(
