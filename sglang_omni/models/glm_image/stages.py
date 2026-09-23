@@ -83,6 +83,13 @@ def _bootstrap(model_path: str):
 
     server_args = ServerArgs(model_path=str(paths.root))
     server_args.pipeline_config = pipeline_config
+    # Offload defaults to on for the text encoder, and upstream relies on a
+    # component residency manager to bring a component back before use. These
+    # stages run without one, so every component stays resident.
+    server_args.text_encoder_cpu_offload = False
+    server_args.image_encoder_cpu_offload = False
+    server_args.vae_cpu_offload = False
+    server_args.dit_cpu_offload = False
     set_global_server_args(server_args)
     return paths, config, server_args
 
