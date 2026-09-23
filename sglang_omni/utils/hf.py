@@ -31,6 +31,7 @@ _CONFIG_MODEL_TYPE_TO_ARCH = {
     "zonos2": "Zonos2ForCausalLM",
 }
 
+_DIFFUSERS_LAYOUT_MARKER = "model_index.json"
 _COSYVOICE3_LAYOUT_MARKER = "cosyvoice3.yaml"
 _COSYVOICE3_ARCHITECTURE = "FunCosyVoice3SGLangModel"
 _AUK_ARCHITECTURE = "AuKForConditionalGeneration"
@@ -176,6 +177,41 @@ def try_resolve_arch_from_cosyvoice3_layout(
     except Exception:
         return None
     return _COSYVOICE3_ARCHITECTURE
+
+
+def _diffusers_pipeline_class(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    class_name = raw.get("_class_name")
+    return class_name if isinstance(class_name, str) and class_name else None
+
+
+def try_resolve_arch_from_diffusers_layout(
+    model_path: str, revision: str | None = None
+) -> str | None:
+    """Resolve a diffusers-layout checkpoint from its model_index.json.
+
+    Such a repository has no top-level config.json, so AutoConfig and the raw
+    config probes all miss it; the pipeline class is the only architecture it
+    declares.
+    """
+    local = os.path.join(model_path, _DIFFUSERS_LAYOUT_MARKER)
+    if os.path.isfile(local):
+        return _diffusers_pipeline_class(local)
+    if os.path.isdir(model_path):
+        return None
+    try:
+        cached = hf_hub_download(
+            repo_id=model_path, filename=_DIFFUSERS_LAYOUT_MARKER, revision=revision
+        )
+    except Exception:
+        return None
+    return _diffusers_pipeline_class(cached)
 
 
 def _auk_architecture_from_config(path: str) -> str | None:
