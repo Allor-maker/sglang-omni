@@ -438,6 +438,23 @@ class Client:
             chunk.sample_rate = sample_rate
 
     @staticmethod
+    def _set_image_data(chunk: GenerateChunk, data: dict[str, Any]) -> None:
+        image_data = data.get("image_data")
+        if image_data is None and data.get("image_pixels") is not None:
+            raw = data.get("image_pixels")
+            if isinstance(raw, memoryview):
+                raw = raw.tobytes()
+            dtype = np.dtype(data.get("image_pixels_dtype", "uint8"))
+            arr = np.frombuffer(raw, dtype=dtype)
+            shape = data.get("image_pixels_shape")
+            if shape:
+                arr = arr.reshape(shape)
+            image_data = arr.copy()
+        if image_data is not None:
+            chunk.image_data = image_data
+            chunk.modality = "image"
+
+    @staticmethod
     def _build_usage_info(data: dict[str, Any]) -> UsageInfo | None:
         usage = dict(data.get("usage") or {})
         if "prompt_tokens" not in usage and data.get("prompt_tokens") is not None:
@@ -536,6 +553,7 @@ class Client:
             if isinstance(language, str):
                 chunk.language = language
             Client._set_audio_data(chunk, result)
+            Client._set_image_data(chunk, result)
             chunk.usage = Client._build_usage_info(result)
             return chunk
         if isinstance(result, str):
@@ -597,6 +615,7 @@ class Client:
             if modality is not None:
                 chunk.modality = modality
             Client._set_audio_data(chunk, data)
+            Client._set_image_data(chunk, data)
             return chunk
         if isinstance(data, str):
             chunk.text = data

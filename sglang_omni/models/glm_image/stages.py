@@ -41,9 +41,10 @@ from sglang_omni.models.glm_image.config import DENOISING_STAGE
 from sglang_omni.models.glm_image.checkpoint import load_json, resolve_checkpoint
 from sglang_omni.models.glm_image.hf_config import make_runtime_config
 from sglang_omni.models.glm_image.payload_types import GLMImageState
-from sglang_omni.scheduling.pipeline_state import load_state, store_state
+from sglang_omni.scheduling.pipeline_state import build_usage, load_state, store_state
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.device import resolve_concrete_device
+from sglang_omni.utils.image_payload import image_pixels_payload
 
 logger = logging.getLogger(__name__)
 
@@ -387,11 +388,10 @@ def create_decode_executor(
         state = load_state(payload, GLMImageState)
         output_batch = stage.forward(_to_req(state, device=device), server_args)
         payload = store_state(payload, state)
-        # TODO(you): omni has no image output contract yet -- every model here
-        # emits modality="audio" or "text", and sglang_omni/utils has no image
-        # payload helper. Decide the response shape (PNG bytes? base64?) and
-        # write output_batch.output into payload.data accordingly.
-        payload.data.update(modality="image")
+        payload.data.update(
+            image_pixels_payload(output_batch.output, source_hint="GLM-Image"),
+            usage=build_usage(state),
+        )
         return payload
 
     return SimpleScheduler(compute, max_concurrency=max_concurrency)
