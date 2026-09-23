@@ -62,37 +62,71 @@ def _parse_seed(value: Any) -> int | None:
     return value
 
 
-def build_glm_image_state(payload: StagePayload) -> GLMImageState:
-    """Build the entry-stage state from an image-generation request."""
-    request = payload.request
-    metadata = request.metadata or {}
-    image_params = metadata.get("image_params")
-    if not isinstance(image_params, dict):
+def validate_image_params(params: Any) -> dict[str, Any]:
+    """Validate an image-generation request, returning normalized fields.
+
+    The HTTP handler calls this to answer a bad request with 400 before the
+    pipeline is dispatched; build_glm_image_state calls it again because the
+    state contract has to hold whatever route produced the payload.
+    """
+    if not isinstance(params, dict):
         raise ValueError("GLM-Image requires a /v1/images/generations request")
 
-    width, height = _parse_size(image_params.get("size"))
-    guidance_scale = image_params.get("guidance_scale")
-    if guidance_scale is not None and not isinstance(guidance_scale, (int, float)):
+    width, height = _parse_size(params.get("size"))
+
+    outputs = _parse_positive_int(params.get("n"), "n", 1)
+    if outputs != 1:
+        # num_outputs exists further down, but multi-output runs sequentially
+        # on NPU and carries per-output usage through Req.extra, which the omni
+        # state does not relay.
+        raise ValueError(f"GLM-Image serves one image per request, got n={outputs}")
+
+    response_format = params.get("response_format") or "b64_json"
+    if response_format != "b64_json":
+        raise ValueError(
+            "GLM-Image only supports response_format=b64_json; there is no "
+            f"object store behind url, got {response_format!r}"
+        )
+
+    guidance_scale = params.get("guidance_scale")
+    if guidance_scale is not None and (
+        isinstance(guidance_scale, bool) or not isinstance(guidance_scale, (int, float))
+    ):
         raise ValueError(
             f"GLM-Image guidance_scale must be a number, got {guidance_scale!r}"
         )
 
+    return {
+        "width": width,
+        "height": height,
+        "n": outputs,
+        "response_format": response_format,
+        "seed": _parse_seed(params.get("seed")),
+        # Zero means "not requested", so the stage default applies.
+        "num_inference_steps": _parse_positive_int(
+            params.get("num_inference_steps"), "num_inference_steps", 0
+        ),
+        "guidance_scale": float(guidance_scale or 0.0),
+    }
+
+
+def build_glm_image_state(payload: StagePayload) -> GLMImageState:
+    """Build the entry-stage state from an image-generation request."""
+    request = payload.request
+    params = validate_image_params((request.metadata or {}).get("image_params"))
     return GLMImageState(
         prompt=_as_non_empty_string(request.inputs, "prompt"),
-        width=width,
-        height=height,
+        width=params["width"],
+        height=params["height"],
         # Both stay at the user's canvas; the AR stage rounds width and height
         # up to the D32 grid and decode crops back to these.
-        requested_width=width,
-        requested_height=height,
-        seed=_parse_seed(image_params.get("seed")),
-        num_outputs=_parse_positive_int(image_params.get("n"), "n", 1),
-        # Zero means "not requested", so the stage default applies.
-        num_inference_steps=_parse_positive_int(
-            image_params.get("num_inference_steps"), "num_inference_steps", 0
-        ),
-        guidance_scale=float(guidance_scale or 0.0),
+        requested_width=params["width"],
+        requested_height=params["height"],
+        seed=params["seed"],
+        num_outputs=params["n"],
+        num_inference_steps=params["num_inference_steps"],
+        guidance_scale=params["guidance_scale"],
     )
 
 
-__all__ = ["build_glm_image_state"]
+__all__ = ["build_glm_image_state", "validate_image_params"]

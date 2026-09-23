@@ -38,6 +38,37 @@ class ChatCompletionAudio(BaseModel):
     transcript: str | None = None
 
 
+class CreateImageRequest(BaseModel):
+    """OpenAI-compatible image generation request."""
+
+    model_config = ConfigDict(extra="allow")
+
+    prompt: str
+    model: str | None = None
+    n: int | None = None
+    size: str | None = None
+    response_format: str | None = None
+    seed: int | None = None
+    # Beyond the OpenAI surface; the pipeline defaults apply when unset.
+    num_inference_steps: int | None = None
+    guidance_scale: float | None = None
+
+
+class ImageResponseData(BaseModel):
+    """One generated image."""
+
+    b64_json: str | None = None
+    revised_prompt: str | None = None
+
+
+class CreateImageResponse(BaseModel):
+    """OpenAI-compatible image generation response."""
+
+    created: int
+    data: list[ImageResponseData]
+    usage: UsageResponse | None = None
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request."""
 

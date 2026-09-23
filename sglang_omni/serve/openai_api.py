@@ -85,12 +85,15 @@ from sglang_omni.serve.protocol import (
     ChatCompletionStreamDelta,
     ChatCompletionStreamResponse,
     ContinueGenerationRequest,
+    CreateImageRequest,
+    CreateImageResponse,
     CreateSpeechBatchRequest,
     DestroyWeightsUpdateGroupRequest,
     GenerateAudio,
     GenerateFinishReason,
     GenerateMetaInfo,
     GenerateResponse,
+    ImageResponseData,
     InitWeightsUpdateGroupRequest,
     ModelCard,
     ModelList,
@@ -300,6 +303,7 @@ def create_app(
     _register_speech(app)
     _register_speech_batch(app)
     _register_speech_ws(app)
+    _register_images(app)
     register_transcriptions(app)
     register_translations(app)
     if enable_realtime:
@@ -1364,6 +1368,74 @@ def _register_speech(app: FastAPI) -> None:
             media_type=result.mime_type,
             headers=headers,
         )
+
+
+def _usage_response_from_chunk(chunk) -> UsageResponse | None:
+    if chunk.usage is None:
+        return None
+    return UsageResponse(
+        prompt_tokens=chunk.usage.prompt_tokens or 0,
+        completion_tokens=chunk.usage.completion_tokens or 0,
+        total_tokens=chunk.usage.total_tokens or 0,
+    )
+
+
+def _register_images(app: FastAPI) -> None:
+    @app.post("/v1/images/generations")
+    async def create_image(req: CreateImageRequest) -> JSONResponse:
+        import base64
+
+        from sglang_omni.models.glm_image.request_builders import validate_image_params
+        from sglang_omni.utils.image_payload import encode_image
+
+        client: Client = app.state.client
+        request_id = f"image-{uuid.uuid4()}"
+
+        image_params = req.model_dump(exclude_none=True, exclude={"prompt", "model"})
+        try:
+            # Same rules the pipeline's state builder applies, run here so a
+            # malformed request is a 400 instead of a stage failure.
+            validate_image_params(image_params)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        gen_req = GenerateRequest(
+            model=req.model,
+            prompt=req.prompt,
+            stream=False,
+            metadata={"image_params": image_params},
+        )
+
+        try:
+            chunk = None
+            async for item in client.generate(gen_req, request_id=request_id):
+                chunk = item
+        except ClientError as exc:
+            status = 400 if _is_bad_request_error(exc) else 500
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Error generating image for request %s", request_id)
+            status = 400 if _is_bad_request_error(exc) else 500
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+        if chunk is None or chunk.image_data is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Pipeline produced no image for request {request_id}",
+            )
+
+        png, _ = encode_image(chunk.image_data, "png")
+        response = CreateImageResponse(
+            created=int(time.time()),
+            data=[
+                ImageResponseData(
+                    b64_json=base64.b64encode(png).decode("ascii"),
+                    revised_prompt=req.prompt,
+                )
+            ],
+            usage=_usage_response_from_chunk(chunk),
+        )
+        return JSONResponse(content=response.model_dump(exclude_none=True))
 
 
 def _register_speech_batch(app: FastAPI) -> None:
