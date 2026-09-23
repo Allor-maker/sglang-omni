@@ -178,9 +178,27 @@ def _attach_residency(stage, stage_name: str, server_args, **modules):
 # ===== payload <-> Req conversion =====
 
 
+def _to_device(value, device):
+    """Put a carried tensor back on the device the stage computes on.
+
+    store_state moves every tensor to CPU so a payload can cross a process
+    boundary, and upstream stages assume their inputs are already placed.
+    Conditioning hands prompt_embeds on as a one-element list, which the DiT
+    unwraps itself, so the container has to survive the move.
+    """
+    if device is None:
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to_device(item, device) for item in value)
+    return value
+
+
 def _to_req(
     state: GLMImageState,
     *,
+    device=None,
     num_inference_steps: int = C.DEFAULT_NUM_INFERENCE_STEPS,
     guidance_scale: float = C.DEFAULT_GUIDANCE_SCALE,
 ) -> Req:
@@ -217,7 +235,7 @@ def _to_req(
     ):
         value = getattr(state, name, None)
         if value is not None:
-            setattr(req, name, value)
+            setattr(req, name, _to_device(value, device))
     return req
 
 
@@ -245,7 +263,7 @@ def _from_req(req: Req, state: GLMImageState) -> GLMImageState:
     return state
 
 
-def _run(stage, server_args, **req_defaults):
+def _run(stage, server_args, device, **req_defaults):
     """Wrap one sglang stage as an omni compute function.
 
     ``req_defaults`` carries the stage's FactoryArgs knobs into the Req, which
@@ -255,7 +273,7 @@ def _run(stage, server_args, **req_defaults):
     @torch.inference_mode()
     def compute(payload):
         state = load_state(payload, GLMImageState)
-        req = _to_req(state, **req_defaults)
+        req = _to_req(state, device=device, **req_defaults)
         # DenoisingStage reads batch.scheduler, not self.scheduler, and the
         # instance carries the schedule conditioning configured on it.
         scheduler = getattr(stage, "scheduler", None)
@@ -279,14 +297,14 @@ def create_ar_executor(
 ) -> SimpleScheduler:
     """AR stage: the VLM turns the prompt into prior tokens."""
     _resolve_dtype(field="dtype", name=dtype)
-    resolve_concrete_device(device, gpu_id)
+    device = resolve_concrete_device(device, gpu_id)
     _, _, server_args = _bootstrap(model_path)
 
     stage = GlmImageAR(
         processor=_load_component(model_path, "processor"),
         vision_language_encoder=_load_component(model_path, "vision_language_encoder"),
     )
-    return SimpleScheduler(_run(stage, server_args), max_concurrency=max_concurrency)
+    return SimpleScheduler(_run(stage, server_args, device), max_concurrency=max_concurrency)
 
 
 def create_before_denoising_executor(
@@ -300,7 +318,7 @@ def create_before_denoising_executor(
 ) -> SimpleScheduler:
     """Conditioning stage: ByT5 glyph embeds, initial noise, timestep schedule."""
     _resolve_dtype(field="dtype", name=dtype)
-    resolve_concrete_device(device, gpu_id)
+    device = resolve_concrete_device(device, gpu_id)
     _, _, server_args = _bootstrap(model_path)
 
     # The DiT is here for its config only on the text-to-image path; the cache
@@ -314,7 +332,7 @@ def create_before_denoising_executor(
     )
 
     return SimpleScheduler(
-        _run(stage, server_args, num_inference_steps=num_inference_steps),
+        _run(stage, server_args, device, num_inference_steps=num_inference_steps),
         max_concurrency=max_concurrency,
     )
 
@@ -330,7 +348,7 @@ def create_denoising_executor(
 ) -> SimpleScheduler:
     """Denoising stage: the DiT sampling loop with classifier-free guidance."""
     _resolve_dtype(field="dtype", name=dtype)
-    resolve_concrete_device(device, gpu_id)
+    device = resolve_concrete_device(device, gpu_id)
     _, _, server_args = _bootstrap(model_path)
 
     transformer = _load_component(model_path, "transformer")
@@ -344,7 +362,7 @@ def create_denoising_executor(
         transformer=transformer,
     )
     return SimpleScheduler(
-        _run(stage, server_args, guidance_scale=guidance_scale),
+        _run(stage, server_args, device, guidance_scale=guidance_scale),
         max_concurrency=max_concurrency,
     )
 
@@ -359,7 +377,7 @@ def create_decode_executor(
 ) -> SimpleScheduler:
     """Decode stage: VAE decode, then crop back to the requested canvas."""
     _resolve_dtype(field="dtype", name=dtype)
-    resolve_concrete_device(device, gpu_id)
+    device = resolve_concrete_device(device, gpu_id)
     _, _, server_args = _bootstrap(model_path)
 
     stage = GlmImageDecodingStage(vae=_load_component(model_path, "vae"))
@@ -367,7 +385,7 @@ def create_decode_executor(
     @torch.inference_mode()
     def compute(payload):
         state = load_state(payload, GLMImageState)
-        output_batch = stage.forward(_to_req(state), server_args)
+        output_batch = stage.forward(_to_req(state, device=device), server_args)
         payload = store_state(payload, state)
         # TODO(you): omni has no image output contract yet -- every model here
         # emits modality="audio" or "text", and sglang_omni/utils has no image
