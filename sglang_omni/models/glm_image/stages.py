@@ -41,6 +41,7 @@ from sglang_omni.models.glm_image.config import DENOISING_STAGE
 from sglang_omni.models.glm_image.checkpoint import load_json, resolve_checkpoint
 from sglang_omni.models.glm_image.hf_config import make_runtime_config
 from sglang_omni.models.glm_image.payload_types import GLMImageState
+from sglang_omni.models.glm_image.request_builders import build_glm_image_state
 from sglang_omni.scheduling.pipeline_state import build_usage, load_state, store_state
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.device import resolve_concrete_device
@@ -264,16 +265,22 @@ def _from_req(req: Req, state: GLMImageState) -> GLMImageState:
     return state
 
 
-def _run(stage, server_args, device, **req_defaults):
+def _run(stage, server_args, device, build_state=None, **req_defaults):
     """Wrap one sglang stage as an omni compute function.
 
     ``req_defaults`` carries the stage's FactoryArgs knobs into the Req, which
-    is where the wrapped sglang logic reads them from.
+    is where the wrapped sglang logic reads them from. The entry stage passes
+    ``build_state``: nothing has written payload.data yet, so the request
+    itself is the only source of state.
     """
 
     @torch.inference_mode()
     def compute(payload):
-        state = load_state(payload, GLMImageState)
+        state = (
+            build_state(payload)
+            if build_state is not None
+            else load_state(payload, GLMImageState)
+        )
         req = _to_req(state, device=device, **req_defaults)
         # DenoisingStage reads batch.scheduler, not self.scheduler, and the
         # instance carries the schedule conditioning configured on it.
@@ -305,7 +312,10 @@ def create_ar_executor(
         processor=_load_component(model_path, "processor"),
         vision_language_encoder=_load_component(model_path, "vision_language_encoder"),
     )
-    return SimpleScheduler(_run(stage, server_args, device), max_concurrency=max_concurrency)
+    return SimpleScheduler(
+        _run(stage, server_args, device, build_state=build_glm_image_state),
+        max_concurrency=max_concurrency,
+    )
 
 
 def create_before_denoising_executor(
