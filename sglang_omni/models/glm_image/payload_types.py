@@ -37,6 +37,9 @@ class GLMImageState(DeclarativeStateBase):
     prompt_embeds: Any | None = wire(None, codec="tensor_cpu")
     negative_prompt_embeds: Any | None = wire(None, codec="tensor_cpu")
     latents: Any | None = wire(None, codec="tensor_cpu")
+    # Shape before any sequence-parallel sharding; denoising reads its batch
+    # dimension. Serializing turns the torch.Size into a plain list.
+    raw_latent_shape: Any | None = None
     timesteps: Any | None = wire(None, codec="tensor_cpu")
     target_size: Any | None = wire(None, codec="tensor_cpu")
     crop_coords: Any | None = wire(None, codec="tensor_cpu")
