@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.server_args.server_args import (
 )
 
 from sglang_omni.models.glm_image import constants as C
+from sglang_omni.models.glm_image.config import DENOISING_STAGE
 from sglang_omni.models.glm_image.checkpoint import load_json, resolve_checkpoint
 from sglang_omni.models.glm_image.hf_config import make_runtime_config
 from sglang_omni.models.glm_image.payload_types import GLMImageState
@@ -137,6 +138,41 @@ def _load_component(model_path: str, name: str):
         component_architecture=architecture,
     )
     return module
+
+
+class _PipelineView:
+    """The three attributes ComponentResidencyPipeline asks of a pipeline.
+
+    It is a Protocol, so this satisfies it structurally. One view per process
+    collects stages and modules as the factories build them.
+    """
+
+    def __init__(self) -> None:
+        self.modules: dict[str, object] = {}
+        self._stage_name_mapping: dict[str, object] = {}
+        self.component_residency_strategies: dict[str, object] = {}
+
+
+_PIPELINE_VIEW = _PipelineView()
+
+
+def _attach_residency(stage, stage_name: str, server_args, **modules):
+    """Give a stage sglang's residency manager.
+
+    DenoisingStage._manage_dit_use_site dereferences the manager with no None
+    check, unlike every other call site. With the offload flags off it resolves
+    ResidentStrategy per component and moves nothing.
+    """
+    from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+        get_global_component_residency_manager,
+    )
+
+    _PIPELINE_VIEW.modules.update(modules)
+    _PIPELINE_VIEW._stage_name_mapping[stage_name] = stage
+    stage.set_component_residency_manager(
+        get_global_component_residency_manager(_PIPELINE_VIEW, server_args)
+    )
+    return stage
 
 
 # ===== payload <-> Req conversion =====
@@ -295,9 +331,15 @@ def create_denoising_executor(
     resolve_concrete_device(device, gpu_id)
     _, _, server_args = _bootstrap(model_path)
 
-    stage = DenoisingStage(
-        transformer=_load_component(model_path, "transformer"),
-        scheduler=_load_component(model_path, "scheduler"),
+    transformer = _load_component(model_path, "transformer")
+    stage = _attach_residency(
+        DenoisingStage(
+            transformer=transformer,
+            scheduler=_load_component(model_path, "scheduler"),
+        ),
+        DENOISING_STAGE,
+        server_args,
+        transformer=transformer,
     )
     return SimpleScheduler(
         _run(stage, server_args, guidance_scale=guidance_scale),
