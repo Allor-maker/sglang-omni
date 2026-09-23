@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-Image stage factories.
 
-Each factory wraps the matching sglang stage: the model modules are loaded
-with ``from_pretrained`` here, sglang's stage object holds the logic, and the
-omni payload is converted to a sglang ``Req`` and back around every call.
+Each factory wraps the matching sglang stage: sglang's own component loaders
+build the modules, its stage object holds the logic, and the omni payload is
+converted to a sglang ``Req`` and back around every call. The loaders matter
+beyond convenience -- they resolve the DiT through sglang's ModelRegistry, and
+only that implementation carries the rotary_emb and kv_caches interface the
+denoising stage drives.
 
 Text-to-image only. The image-conditioned path additionally runs the DiT to
 fill a reference KV cache, which the payload cannot carry between stages.
@@ -12,8 +15,8 @@ fill a reference KV cache, which the payload cannot carry between stages.
 from __future__ import annotations
 
 import logging
+import os
 from functools import lru_cache
-from types import SimpleNamespace
 
 import torch
 
@@ -34,7 +37,7 @@ from sglang.multimodal_gen.runtime.server_args.server_args import (
 )
 
 from sglang_omni.models.glm_image import constants as C
-from sglang_omni.models.glm_image.checkpoint import resolve_checkpoint
+from sglang_omni.models.glm_image.checkpoint import load_json, resolve_checkpoint
 from sglang_omni.models.glm_image.hf_config import make_runtime_config
 from sglang_omni.models.glm_image.payload_types import GLMImageState
 from sglang_omni.scheduling.pipeline_state import load_state, store_state
@@ -85,34 +88,48 @@ def _bootstrap(model_path: str):
 
 
 @lru_cache(maxsize=None)
-def _load_scheduler(scheduler_path: str):
-    """One scheduler instance shared by conditioning and denoising.
+def _init_parallel() -> None:
+    """Stand up one-process parallel groups, which sglang's DiT layers need.
 
-    Conditioning configures the sigma schedule on it (resolution-dependent mu)
-    and denoising reads it back off the Req, so a second instance would sample
-    on an unconfigured schedule. Its step index is mutable state, which holds
-    only while both stages stay at max_concurrency=1 in one process.
+    Its ColumnParallelLinear and USPAttention read the TP and SP groups while
+    being constructed, and the forward calls get_sp_world_size() unguarded.
     """
-    from diffusers import FlowMatchEulerDiscreteScheduler
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        maybe_init_distributed_environment_and_model_parallel,
+    )
 
-    return FlowMatchEulerDiscreteScheduler.from_pretrained(scheduler_path)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29511")
+    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
-class _TransformerConfigView:
-    """The DiT's config for a stage that reads it but never calls the module.
+@lru_cache(maxsize=None)
+def _load_component(model_path: str, name: str):
+    """Load one checkpoint component through sglang's own loader.
 
-    T2I conditioning only reads in_channels, num_layers and patch_size off the
-    transformer; I2I also runs it to fill the reference KV cache (upstream
-    stage lines 1305-1334) and needs the real module instead.
+    The library and class come from model_index.json, so the DiT resolves
+    through sglang's ModelRegistry rather than to the diffusers class: only
+    sglang's carries the rotary_emb and kv_caches interface DenoisingStage
+    drives. Cached per name, so stages sharing a process share the module --
+    the scheduler in particular must be one instance, because conditioning
+    configures its resolution-dependent sigma schedule and denoising reads it
+    back off the Req.
     """
+    from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+        PipelineComponentLoader,
+    )
 
-    def __init__(self, transformer_config: dict, dtype: torch.dtype):
-        # hasattr(config, "sample_size") must stay False: upstream falls back
-        # to 128, and GLM-Image checkpoints do not ship the key.
-        self.config = SimpleNamespace(
-            **{k: v for k, v in transformer_config.items() if not k.startswith("_")}
-        )
-        self.dtype = dtype
+    _init_parallel()
+    paths, _, server_args = _bootstrap(model_path)
+    library, architecture = load_json(paths.model_index)[name]
+    module, _ = PipelineComponentLoader.load_component(
+        component_name=name,
+        component_model_path=str(getattr(paths, name)),
+        transformers_or_diffusers=library,
+        server_args=server_args,
+        component_architecture=architecture,
+    )
+    return module
 
 
 # ===== payload <-> Req conversion =====
@@ -216,21 +233,14 @@ def create_ar_executor(
     max_concurrency: int = 1,
 ) -> SimpleScheduler:
     """AR stage: the VLM turns the prompt into prior tokens."""
-    from transformers import GlmImageForConditionalGeneration, GlmImageProcessor
+    _resolve_dtype(field="dtype", name=dtype)
+    resolve_concrete_device(device, gpu_id)
+    _, _, server_args = _bootstrap(model_path)
 
-    torch_dtype = _resolve_dtype(field="dtype", name=dtype)
-    device = resolve_concrete_device(device, gpu_id)
-    paths, _, server_args = _bootstrap(model_path)
-
-    processor = GlmImageProcessor.from_pretrained(str(paths.processor))
-    vlm = (
-        GlmImageForConditionalGeneration.from_pretrained(
-            str(paths.vision_language_encoder), torch_dtype=torch_dtype
-        )
-        .to(device)
-        .eval()
+    stage = GlmImageAR(
+        processor=_load_component(model_path, "processor"),
+        vision_language_encoder=_load_component(model_path, "vision_language_encoder"),
     )
-    stage = GlmImageAR(processor=processor, vision_language_encoder=vlm)
     return SimpleScheduler(_run(stage, server_args), max_concurrency=max_concurrency)
 
 
@@ -244,32 +254,18 @@ def create_before_denoising_executor(
     max_concurrency: int = 1,
 ) -> SimpleScheduler:
     """Conditioning stage: ByT5 glyph embeds, initial noise, timestep schedule."""
-    from diffusers import AutoencoderKL
-    from transformers import AutoTokenizer, T5EncoderModel
+    _resolve_dtype(field="dtype", name=dtype)
+    resolve_concrete_device(device, gpu_id)
+    _, _, server_args = _bootstrap(model_path)
 
-    torch_dtype = _resolve_dtype(field="dtype", name=dtype)
-    device = resolve_concrete_device(device, gpu_id)
-    paths, config, server_args = _bootstrap(model_path)
-
-    tokenizer = AutoTokenizer.from_pretrained(str(paths.tokenizer))
-    text_encoder = (
-        T5EncoderModel.from_pretrained(str(paths.text_encoder), torch_dtype=torch_dtype)
-        .to(device)
-        .eval()
-    )
-    vae = (
-        AutoencoderKL.from_pretrained(str(paths.vae), torch_dtype=torch_dtype)
-        .to(device)
-        .eval()
-    )
-    scheduler = _load_scheduler(str(paths.scheduler))
-
+    # The DiT is here for its config only on the text-to-image path; the cache
+    # hands back the same module the denoising stage runs, not a second copy.
     stage = GlmImageBeforeDenoisingStage(
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        vae=vae,
-        transformer=_TransformerConfigView(config.transformer, torch_dtype),
-        scheduler=scheduler,
+        tokenizer=_load_component(model_path, "tokenizer"),
+        text_encoder=_load_component(model_path, "text_encoder"),
+        vae=_load_component(model_path, "vae"),
+        transformer=_load_component(model_path, "transformer"),
+        scheduler=_load_component(model_path, "scheduler"),
     )
 
     return SimpleScheduler(
@@ -288,22 +284,14 @@ def create_denoising_executor(
     max_concurrency: int = 1,
 ) -> SimpleScheduler:
     """Denoising stage: the DiT sampling loop with classifier-free guidance."""
-    from diffusers import GlmImageTransformer2DModel
+    _resolve_dtype(field="dtype", name=dtype)
+    resolve_concrete_device(device, gpu_id)
+    _, _, server_args = _bootstrap(model_path)
 
-    torch_dtype = _resolve_dtype(field="dtype", name=dtype)
-    device = resolve_concrete_device(device, gpu_id)
-    paths, _, server_args = _bootstrap(model_path)
-
-    transformer = (
-        GlmImageTransformer2DModel.from_pretrained(
-            str(paths.transformer), torch_dtype=torch_dtype
-        )
-        .to(device)
-        .eval()
+    stage = DenoisingStage(
+        transformer=_load_component(model_path, "transformer"),
+        scheduler=_load_component(model_path, "scheduler"),
     )
-    scheduler = _load_scheduler(str(paths.scheduler))
-
-    stage = DenoisingStage(transformer=transformer, scheduler=scheduler)
     return SimpleScheduler(
         _run(stage, server_args, guidance_scale=guidance_scale),
         max_concurrency=max_concurrency,
@@ -319,18 +307,11 @@ def create_decode_executor(
     max_concurrency: int = 1,
 ) -> SimpleScheduler:
     """Decode stage: VAE decode, then crop back to the requested canvas."""
-    from diffusers import AutoencoderKL
+    _resolve_dtype(field="dtype", name=dtype)
+    resolve_concrete_device(device, gpu_id)
+    _, _, server_args = _bootstrap(model_path)
 
-    torch_dtype = _resolve_dtype(field="dtype", name=dtype)
-    device = resolve_concrete_device(device, gpu_id)
-    paths, _, server_args = _bootstrap(model_path)
-
-    vae = (
-        AutoencoderKL.from_pretrained(str(paths.vae), torch_dtype=torch_dtype)
-        .to(device)
-        .eval()
-    )
-    stage = GlmImageDecodingStage(vae=vae)
+    stage = GlmImageDecodingStage(vae=_load_component(model_path, "vae"))
 
     @torch.inference_mode()
     def compute(payload):
