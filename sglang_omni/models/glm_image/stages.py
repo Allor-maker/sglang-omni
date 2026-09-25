@@ -197,6 +197,32 @@ def _to_device(value, device):
     return value
 
 
+# Everything a stage produces for a later one. All of it is tensor-shaped, so
+# the terminal stage clears it: the completion message to the coordinator goes
+# through plain msgpack, which cannot pack a Tensor even on CPU.
+_CARRIED_FIELDS = (
+    "prior_token_id",
+    "prompt_embeds",
+    "negative_prompt_embeds",
+    "latents",
+    "raw_latent_shape",
+    "timesteps",
+    "target_size",
+    "crop_coords",
+    "prior_token_drop_cond",
+    "prior_token_drop_uncond",
+)
+
+# Resolution the AR stage aligned up; decode crops back to the requested one.
+_RESOLVED_FIELDS = ("width", "height", "requested_width", "requested_height")
+
+
+def _clear_carried(state: GLMImageState) -> GLMImageState:
+    for name in _CARRIED_FIELDS:
+        setattr(state, name, None)
+    return state
+
+
 def _to_req(
     state: GLMImageState,
     *,
@@ -221,20 +247,9 @@ def _to_req(
         guidance_scale=state.guidance_scale or guidance_scale,
     )
     req = Req(sampling_params=sampling_params)
-    # Fields the earlier stages already produced. Req delegates unknown names
-    # to sampling_params, so only set what the stage actually reads.
-    for name in (
-        "prior_token_id",
-        "prompt_embeds",
-        "negative_prompt_embeds",
-        "latents",
-        "raw_latent_shape",
-        "timesteps",
-        "target_size",
-        "crop_coords",
-        "prior_token_drop_cond",
-        "prior_token_drop_uncond",
-    ):
+    # Req delegates unknown names to sampling_params, so only set what the
+    # stage actually reads.
+    for name in _CARRIED_FIELDS:
         value = getattr(state, name, None)
         if value is not None:
             setattr(req, name, _to_device(value, device))
@@ -243,22 +258,7 @@ def _to_req(
 
 def _from_req(req: Req, state: GLMImageState) -> GLMImageState:
     """Copy back the fields the stage produced."""
-    for name in (
-        "prior_token_id",
-        "prompt_embeds",
-        "negative_prompt_embeds",
-        "latents",
-        "raw_latent_shape",
-        "timesteps",
-        "target_size",
-        "crop_coords",
-        "prior_token_drop_cond",
-        "prior_token_drop_uncond",
-        "width",
-        "height",
-        "requested_width",
-        "requested_height",
-    ):
+    for name in _CARRIED_FIELDS + _RESOLVED_FIELDS:
         value = getattr(req, name, None)
         if value is not None:
             setattr(state, name, value)
@@ -397,7 +397,7 @@ def create_decode_executor(
     def compute(payload):
         state = load_state(payload, GLMImageState)
         output_batch = stage.forward(_to_req(state, device=device), server_args)
-        payload = store_state(payload, state)
+        payload = store_state(payload, _clear_carried(state))
         payload.data.update(
             image_pixels_payload(output_batch.output, source_hint="GLM-Image"),
             usage=build_usage(state),
