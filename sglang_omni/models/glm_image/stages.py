@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from functools import lru_cache
 
 import torch
@@ -36,6 +35,7 @@ from sglang.multimodal_gen.runtime.server_args.server_args import (
     ServerArgs,
     set_global_server_args,
 )
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 from sglang_omni.models.glm_image import constants as C
 from sglang_omni.models.glm_image.config import DENOISING_STAGE
@@ -266,14 +266,12 @@ def _from_req(req: Req, state: GLMImageState) -> GLMImageState:
     return state
 
 
-def _record_usage(state: GLMImageState, started: float) -> GLMImageState:
-    """Accumulate per-stage timing, and the token counts once they exist.
+def _record_usage(state: GLMImageState) -> GLMImageState:
+    """Count tokens where they first appear, so no stage has to know its place.
 
-    Counted where they first appear so no stage has to know which one it is:
-    prior tokens are what the AR generated, glyph bytes are what ByT5 encoded
-    for the text the image has to render.
+    Timing is left to StageProfiler, which reports per stage rather than as one
+    sum and drains the device queue so a stage is charged for its own kernels.
     """
-    state.engine_time_s += time.perf_counter() - started
     if not state.completion_tokens and state.prior_token_id is not None:
         state.completion_tokens = int(state.prior_token_id.numel())
     if not state.prompt_tokens:
@@ -296,22 +294,24 @@ def _run(stage, server_args, device, build_state=None, **req_defaults):
     itself is the only source of state.
     """
 
+    stage_name = type(stage).__name__
+
     @torch.inference_mode()
     def compute(payload):
-        started = time.perf_counter()
-        state = (
-            build_state(payload)
-            if build_state is not None
-            else load_state(payload, GLMImageState)
-        )
-        req = _to_req(state, device=device, **req_defaults)
-        # DenoisingStage reads batch.scheduler, not self.scheduler, and the
-        # instance carries the schedule conditioning configured on it.
-        scheduler = getattr(stage, "scheduler", None)
-        if scheduler is not None:
-            req.scheduler = scheduler
-        state = _from_req(stage.forward(req, server_args), state)
-        return store_state(payload, _record_usage(state, started))
+        with StageProfiler(stage_name, logger, metrics=None, log_stage_start_end=True):
+            state = (
+                build_state(payload)
+                if build_state is not None
+                else load_state(payload, GLMImageState)
+            )
+            req = _to_req(state, device=device, **req_defaults)
+            # DenoisingStage reads batch.scheduler, not self.scheduler, and the
+            # instance carries the schedule conditioning configured on it.
+            scheduler = getattr(stage, "scheduler", None)
+            if scheduler is not None:
+                req.scheduler = scheduler
+            state = _from_req(stage.forward(req, server_args), state)
+        return store_state(payload, _record_usage(state))
 
     return compute
 
@@ -415,12 +415,14 @@ def create_decode_executor(
 
     stage = GlmImageDecodingStage(vae=_load_component(model_path, "vae"))
 
+    stage_name = type(stage).__name__
+
     @torch.inference_mode()
     def compute(payload):
-        started = time.perf_counter()
-        state = load_state(payload, GLMImageState)
-        output_batch = stage.forward(_to_req(state, device=device), server_args)
-        _record_usage(state, started)
+        with StageProfiler(stage_name, logger, metrics=None, log_stage_start_end=True):
+            state = load_state(payload, GLMImageState)
+            output_batch = stage.forward(_to_req(state, device=device), server_args)
+        _record_usage(state)
         payload = store_state(payload, _clear_carried(state))
         payload.data.update(
             image_pixels_payload(output_batch.output, source_hint="GLM-Image"),
