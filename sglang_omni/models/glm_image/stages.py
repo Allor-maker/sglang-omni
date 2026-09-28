@@ -276,9 +276,12 @@ def _record_usage(state: GLMImageState, started: float) -> GLMImageState:
     state.engine_time_s += time.perf_counter() - started
     if not state.completion_tokens and state.prior_token_id is not None:
         state.completion_tokens = int(state.prior_token_id.numel())
-    if not state.prompt_tokens and state.prompt_embeds is not None:
+    if not state.prompt_tokens:
+        # Req defaults prompt_embeds to [], and stages before conditioning
+        # carry that empty list rather than None.
         embeds = state.prompt_embeds
-        embeds = embeds[0] if isinstance(embeds, (list, tuple)) else embeds
+        if isinstance(embeds, (list, tuple)):
+            embeds = embeds[0] if embeds else None
         if embeds is not None and embeds.dim() >= 2:
             state.prompt_tokens = int(embeds.shape[-2])
     return state
