@@ -29,6 +29,9 @@ class GLMImageState(DeclarativeStateBase):
     num_outputs: int = wire(1, codec="int")
     num_inference_steps: int = wire(0, codec="int")
     guidance_scale: float = wire(0.0, codec="float")
+    # Wall-clock epoch seconds, not perf_counter: the value is compared in the
+    # decode stage, which need not share a process with the entry stage.
+    request_started_at: float = wire(0.0, codec="float")
 
     # --- produced by the AR stage ---
     prior_token_id: Any | None = wire(None, codec="tensor_cpu")

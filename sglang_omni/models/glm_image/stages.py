@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from functools import lru_cache
 
 import torch
@@ -298,12 +299,13 @@ def _run(stage, server_args, device, build_state=None, **req_defaults):
 
     @torch.inference_mode()
     def compute(payload):
+        received = time.time()
         with StageProfiler(stage_name, logger, metrics=None, log_stage_start_end=True):
-            state = (
-                build_state(payload)
-                if build_state is not None
-                else load_state(payload, GLMImageState)
-            )
+            if build_state is not None:
+                state = build_state(payload)
+                state.request_started_at = received
+            else:
+                state = load_state(payload, GLMImageState)
             req = _to_req(state, device=device, **req_defaults)
             # DenoisingStage reads batch.scheduler, not self.scheduler, and the
             # instance carries the schedule conditioning configured on it.
@@ -428,6 +430,13 @@ def create_decode_executor(
             image_pixels_payload(output_batch.output, source_hint="GLM-Image"),
             usage=build_usage(state),
         )
+        if state.request_started_at:
+            # Same wording as sglang's log_generation_timer, and the same span:
+            # from the pipeline taking the request to the output being ready.
+            logger.info(
+                "Pixel data generated successfully in %.2f seconds",
+                time.time() - state.request_started_at,
+            )
         return payload
 
     return SimpleScheduler(compute, max_concurrency=max_concurrency)
