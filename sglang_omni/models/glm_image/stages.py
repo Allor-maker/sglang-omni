@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from functools import lru_cache
 
 import torch
@@ -265,6 +266,24 @@ def _from_req(req: Req, state: GLMImageState) -> GLMImageState:
     return state
 
 
+def _record_usage(state: GLMImageState, started: float) -> GLMImageState:
+    """Accumulate per-stage timing, and the token counts once they exist.
+
+    Counted where they first appear so no stage has to know which one it is:
+    prior tokens are what the AR generated, glyph bytes are what ByT5 encoded
+    for the text the image has to render.
+    """
+    state.engine_time_s += time.perf_counter() - started
+    if not state.completion_tokens and state.prior_token_id is not None:
+        state.completion_tokens = int(state.prior_token_id.numel())
+    if not state.prompt_tokens and state.prompt_embeds is not None:
+        embeds = state.prompt_embeds
+        embeds = embeds[0] if isinstance(embeds, (list, tuple)) else embeds
+        if embeds is not None and embeds.dim() >= 2:
+            state.prompt_tokens = int(embeds.shape[-2])
+    return state
+
+
 def _run(stage, server_args, device, build_state=None, **req_defaults):
     """Wrap one sglang stage as an omni compute function.
 
@@ -276,6 +295,7 @@ def _run(stage, server_args, device, build_state=None, **req_defaults):
 
     @torch.inference_mode()
     def compute(payload):
+        started = time.perf_counter()
         state = (
             build_state(payload)
             if build_state is not None
@@ -287,7 +307,8 @@ def _run(stage, server_args, device, build_state=None, **req_defaults):
         scheduler = getattr(stage, "scheduler", None)
         if scheduler is not None:
             req.scheduler = scheduler
-        return store_state(payload, _from_req(stage.forward(req, server_args), state))
+        state = _from_req(stage.forward(req, server_args), state)
+        return store_state(payload, _record_usage(state, started))
 
     return compute
 
@@ -332,8 +353,6 @@ def create_before_denoising_executor(
     device = resolve_concrete_device(device, gpu_id)
     _, _, server_args = _bootstrap(model_path)
 
-    # The DiT is here for its config only on the text-to-image path; the cache
-    # hands back the same module the denoising stage runs, not a second copy.
     stage = GlmImageBeforeDenoisingStage(
         tokenizer=_load_component(model_path, "tokenizer"),
         text_encoder=_load_component(model_path, "text_encoder"),
@@ -395,8 +414,10 @@ def create_decode_executor(
 
     @torch.inference_mode()
     def compute(payload):
+        started = time.perf_counter()
         state = load_state(payload, GLMImageState)
         output_batch = stage.forward(_to_req(state, device=device), server_args)
+        _record_usage(state, started)
         payload = store_state(payload, _clear_carried(state))
         payload.data.update(
             image_pixels_payload(output_batch.output, source_hint="GLM-Image"),
