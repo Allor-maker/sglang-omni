@@ -1,9 +1,10 @@
 from sglang_omni.scheduling.engine_factory import SGLangGenerationEngineBuilder
 from sglang_omni.models.glm_image.checkpoint import resolve_checkpoint as resolve_root
-
+from transformers import AutoProcessor
 from typing import Any
 from sglang_omni.platforms import current_platform
 
+from sglang_omni.models.glm_image.sglang_request_builder import make_glm_image_ar_adapters
 class GLMImageEngineBuilder(SGLangGenerationEngineBuilder):
     model_name = "GLM-Image"
     model_arch_override = "GlmImageForConditionalGeneration"
@@ -12,12 +13,18 @@ class GLMImageEngineBuilder(SGLangGenerationEngineBuilder):
     def __init__(self, max_concurrency):
         self.max_concurrency = max_concurrency
         self.paths = None
+        self.processor = None
 
     def resolve_checkpoint(self, model_path):
         self.paths = resolve_root(model_path=model_path)
         return str(self.paths.vision_language_encoder)
 
-
+    
+    def pre_infra_setup(self, checkpoint_dir: str) -> None:
+        del checkpoint_dir
+        self.processor = AutoProcessor.from_pretrained(
+            str(self.paths.processor)
+        )
     
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
         defaults: dict[str, Any] = {
@@ -44,12 +51,11 @@ class GLMImageEngineBuilder(SGLangGenerationEngineBuilder):
  
     def make_adapters(self, model):
 
-        def request_builder(payload):
-            raise NotImplementedError("Not implement for GLM-Image yet")
-
-        def request_adapter(data):
-            raise NotImplementedError("Not implement for GLM-Image yet")
-            
-        return (request_builder, request_adapter)
+        return make_glm_image_ar_adapters(
+            processor=self.processor,
+            image_start_token_id=model.config.image_start_token_id,
+            image_end_token_id=model.config.image_end_token_id,
+            vocab_size=model.config.text_config.vision_vocab_size,
+        )
         
     
