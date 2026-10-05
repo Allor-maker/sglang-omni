@@ -49,6 +49,8 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.device import resolve_concrete_device
 from sglang_omni.utils.image_payload import image_pixels_payload
 
+from typing import Any
+
 logger = logging.getLogger(__name__)
 
 _TORCH_DTYPES = {
@@ -243,7 +245,7 @@ def _to_req(
         prompt=state.prompt,
         width=state.width or None,
         height=state.height or None,
-        seed=state.seed if state.seed is not None else 42,
+        seed=state.seed if state.seed is not None else C.DEFAULT_SEED,
         num_outputs_per_prompt=state.num_outputs,
         num_inference_steps=state.num_inference_steps or num_inference_steps,
         guidance_scale=state.guidance_scale or guidance_scale,
@@ -319,9 +321,32 @@ def _run(stage, server_args, device, build_state=None, **req_defaults):
 
 
 # ===== stage factories =====
+def create_srt_ar_executor(
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    max_concurrency: int = 1,
+    dtype: str = "bfloat16",
+    server_args_overrides: dict[str, Any] | None = None,
+):
+    """Returns OmniScheduler for the GLM-Image AR engine."""
+    from sglang_omni.models.glm_image.engine_builder import (
+        GLMImageEngineBuilder,
+    )
+
+    return GLMImageEngineBuilder(
+        max_concurrency=max_concurrency,
+    ).build(
+        model_path,
+        device=device,
+        gpu_id=gpu_id,
+        dtype=dtype,
+        server_args_overrides=server_args_overrides,
+    )
 
 
-def create_ar_executor(
+def create_hf_ar_executor(
     model_path: str,
     *,
     device: str | None = None,

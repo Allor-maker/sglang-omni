@@ -22,7 +22,7 @@ class GLMImagePipelineConfig(PipelineConfig):
         StageConfig(
             name=GLM_IMAGE_AR,
             process="pipeline",
-            factory_path=f"{_PKG}.stages.create_ar_executor",
+            factory_path=f"{_PKG}.stages.create_hf_ar_executor",
             factory=FactoryArgs(
                 device=current_platform.device_type,
                 dtype="bfloat16",

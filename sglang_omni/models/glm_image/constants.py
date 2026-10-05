@@ -14,3 +14,5 @@ DEFAULT_IMAGE_SIZE = 1024
 # 128 * vae_scale_factor * patch_size. GLM-Image checkpoints omit that key and
 # position with RoPE, so treat this as a guard rather than a model limit.
 MAX_IMAGE_SIZE = 2048
+
+DEFAULT_SEED = 42
