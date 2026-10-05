@@ -5,8 +5,6 @@ from sglang.srt.multimodal.processors.glm_image import GlmImageProcessor
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import GlmImageAR
 from sglang.multimodal_gen.configs.sample.glmimage import align_glm_image_resolution
 
-import torch
-
 from sglang_omni.proto import StagePayload
 
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
@@ -15,7 +13,8 @@ from sglang_omni.scheduling.pipeline_state import store_state
 from sglang_omni.models.glm_image.request_builders import build_glm_image_state
 import sglang_omni.models.glm_image.constants as C
 
-from dataclasses import dataclass, field
+import torch
+from dataclasses import dataclass
 
 from sglang_omni.models.glm_image.payload_types import GLMImageState
 
@@ -119,8 +118,32 @@ def make_glm_image_ar_adapters(processor, image_start_token_id, image_end_token_
             )
 
     def result_adapter(data):
-        raise NotImplementedError("Not implemented yet for GLM-Image")
+        state = data.state
+        payload = data.stage_payload
+        offset, token_h, token_w = data.generation_shape
+        output_ids = list(data.output_ids or [])
+        actual_output_len = len(output_ids)
+        expected_output_len = offset + token_w * token_h
 
+        if actual_output_len < expected_output_len:
+            raise RuntimeError(
+                "GLM-Image AR returned too few output_ids: "
+                f"got {actual_output_len}, need at least {expected_output_len} "
+                f"(large_image_offset={offset}, "
+                f"token_h={token_h}, token_w={token_w})."
+            )
+        prior_token_ids_d32 = torch.tensor(
+            output_ids[offset : offset + token_h * token_w],
+            dtype=torch.long,
+        )
+
+        state.prior_token_id = GlmImageAR._upsample_token_ids(prior_token_ids_d32, token_h, token_w)
+
+        state.prompt_tokens = len(data.input_ids)
+        state.completion_tokens = actual_output_len
+        logger.info("[GlmImageAR] finished in %.4f seconds", time.time() - state.request_started_at)
+
+        return store_state(payload, state)
     
 
 
