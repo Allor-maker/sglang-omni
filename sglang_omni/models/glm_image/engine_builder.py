@@ -58,13 +58,3 @@ class GLMImageEngineBuilder(SGLangGenerationEngineBuilder):
             image_end_token_id=model.config.image_end_token_id,
             vocab_size=model.config.text_config.vision_vocab_size,
         )
-
-    def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
-        del model_runner
-        # Newer sglang wraps the Scheduler methods OmniScheduler borrows in
-        # @scheduler_stage_method, which reads this attribute; upstream sets it in
-        # Scheduler.__init__, which OmniScheduler (pinned to 0.5.19) never runs.
-        # Drop once OmniScheduler sets it itself.
-        scheduler.scheduler_stage_metrics = (
-            scheduler.metrics_reporter.scheduler_stage_metrics
-        )
