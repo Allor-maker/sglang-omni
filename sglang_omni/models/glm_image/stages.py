@@ -357,6 +357,7 @@ def create_hf_ar_executor(
     """AR stage: the VLM turns the prompt into prior tokens."""
     _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
+    os.environ["LOCAL_RANK"] = str(device.index)
     _, _, server_args = _bootstrap(model_path)
 
     stage = GlmImageAR(
@@ -381,6 +382,7 @@ def create_before_denoising_executor(
     """Conditioning stage: ByT5 glyph embeds, initial noise, timestep schedule."""
     _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
+    os.environ["LOCAL_RANK"] = str(device.index)
     _, _, server_args = _bootstrap(model_path)
 
     stage = GlmImageBeforeDenoisingStage(
@@ -409,6 +411,7 @@ def create_denoising_executor(
     """Denoising stage: the DiT sampling loop with classifier-free guidance."""
     _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
+    os.environ["LOCAL_RANK"] = str(device.index)
     _, _, server_args = _bootstrap(model_path)
 
     transformer = _load_component(model_path, "transformer")
@@ -438,6 +441,7 @@ def create_decode_executor(
     """Decode stage: VAE decode, then crop back to the requested canvas."""
     _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
+    os.environ["LOCAL_RANK"] = str(device.index)
     _, _, server_args = _bootstrap(model_path)
 
     stage = GlmImageDecodingStage(vae=_load_component(model_path, "vae"))
