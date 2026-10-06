@@ -11,16 +11,48 @@ class GLMImageEngineBuilder(SGLangGenerationEngineBuilder):
     model_arch_override = "GlmImageForConditionalGeneration"
     context_length = 8192
 
-    def __init__(self, max_concurrency):
+    def __init__(
+            self, 
+            max_concurrency,
+            tp_rank: int = 0,
+            tp_size: int = 1,
+            nccl_port: int | None = None,
+        ):
         self.max_concurrency = max_concurrency
         self.paths = None
         self.processor = None
+        
+        tp_rank = int(tp_rank)
+        tp_size = int(tp_size)
 
+        if tp_size <= 0:
+            raise ValueError(
+                f"tp_size must be positive; got {tp_size}"
+            )
+        if tp_rank < 0 or tp_rank >= tp_size:
+            raise ValueError(
+                f"tp_rank={tp_rank} is out of range "
+                f"for tp_size={tp_size}"
+            )
+        if tp_size > 1 and nccl_port is None:
+            raise ValueError("TP requires nccl_port")
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.nccl_port = nccl_port
+        
     def resolve_checkpoint(self, model_path):
         self.paths = resolve_root(model_path=model_path)
         return str(self.paths.vision_language_encoder)
 
-    
+    def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        overrides["tp_size"] = self.tp_size
+
+    def infra_kwargs(self) -> dict[str, Any]:
+        return {
+            "tp_rank": self.tp_rank,
+            "nccl_port": self.nccl_port,
+        }
+
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         del checkpoint_dir
         self.processor = AutoProcessor.from_pretrained(

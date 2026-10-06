@@ -329,6 +329,9 @@ def create_srt_ar_executor(
     max_concurrency: int = 1,
     dtype: str = "bfloat16",
     server_args_overrides: dict[str, Any] | None = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
 ):
     """Returns OmniScheduler for the GLM-Image AR engine."""
     from sglang_omni.models.glm_image.engine_builder import (
@@ -337,6 +340,9 @@ def create_srt_ar_executor(
 
     return GLMImageEngineBuilder(
         max_concurrency=max_concurrency,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        nccl_port=nccl_port,
     ).build(
         model_path,
         device=device,
@@ -357,6 +363,8 @@ def create_hf_ar_executor(
     """AR stage: the VLM turns the prompt into prior tokens."""
     _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
+    # sglang multimodal_gen places modules on npu:{LOCAL_RANK}, not on our device;
+    # drop once each stage process sees only its own card as index 0.
     os.environ["LOCAL_RANK"] = str(device.index)
     _, _, server_args = _bootstrap(model_path)
 
