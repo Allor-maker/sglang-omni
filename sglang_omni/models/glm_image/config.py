@@ -24,7 +24,7 @@ GLM_IMAGE_DIT = "glm_image_dit"
 DENOISING_STAGE = "denoising_stage"
 
 
-def _dit_stages(*, process: str, gpu: int) -> list[StageConfig]:
+def _dit_stages(*, process: str, gpu: int | list[int], tp_size: int = 1, sp_degree: int = 1) -> list[StageConfig]:
     return [
         StageConfig(
             name=GLM_IMAGE_DIT,
@@ -36,18 +36,19 @@ def _dit_stages(*, process: str, gpu: int) -> list[StageConfig]:
                 num_inference_steps=C.DEFAULT_NUM_INFERENCE_STEPS,
                 guidance_scale=C.DEFAULT_GUIDANCE_SCALE,
                 max_concurrency=1,
-                sp_degree=1,
+                sp_degree=sp_degree,
                 ulysses_degree=None,
                 ring_degree=1,
             ),
             gpu=gpu,
+            tp_size=tp_size,
             terminal=True,
         ),
     ]
 
 
 def _srt_stages(
-    *, dit_gpu: int, kv_cache_bytes: str | None = None
+    *, ar_gpus: list[int], dit_gpus: list[int], dit_sp_degree: int = 1, kv_cache_bytes: str | None = None
 ) -> list[StageConfig]:
     # The srt engine sets up its own torch.distributed world, and the DiT stack
     # sets up another in _init_parallel; separate processes keep them apart.
@@ -62,21 +63,27 @@ def _srt_stages(
                 max_concurrency=1,
             ),
             engine=EngineArgs(kv_cache_bytes=kv_cache_bytes),
-            gpu=0,
+            tp_size = len(ar_gpus),
+            gpu=ar_gpus,
             next=GLM_IMAGE_DIT,
         ),
-        *_dit_stages(process="glm_image_dit", gpu=dit_gpu),
+        *_dit_stages(
+            process="glm_image_dit", 
+            tp_size=len(dit_gpus), 
+            gpu=dit_gpus, 
+            sp_degree=dit_sp_degree
+        ),
     ]
 
 
 def _dual_npu_stages() -> list[StageConfig]:
-    return _srt_stages(dit_gpu=1)
+    return _srt_stages(ar_gpus=[0], dit_gpus=[1])
 
 
 def _single_npu_stages() -> list[StageConfig]:
     # Without a fixed KV pool srt sizes it from a fraction of the card and
     # leaves the DiT too little; one request at 2048x2048 needs ~4.4k tokens.
-    return _srt_stages(dit_gpu=0, kv_cache_bytes="4GiB")
+    return _srt_stages(ar_gpus=[0], dit_gpus=[0], kv_cache_bytes="4GiB")
 
 
 class GLMImagePipelineConfig(PipelineConfig):
