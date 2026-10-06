@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.g
 from sglang.multimodal_gen.runtime.server_args.server_args import (
     ServerArgs,
     set_global_server_args,
+    get_global_server_args,
 )
 
 from sglang_omni.models.glm_image import constants as C
@@ -69,7 +70,7 @@ def _resolve_dtype(*, field: str, name: str) -> torch.dtype:
 
 
 @lru_cache(maxsize=None)
-def _bootstrap(model_path: str):
+def _bootstrap(model_path: str, num_gpus, tp_size, sp_degree, ulysses_degree, ring_degree, cfg_parallel_degree=1, dp_size=1):
     """Stand up the sglang globals a wrapped stage needs, once per process.
 
     ``PipelineStage.__init__`` reads ``get_global_server_args()``, and
@@ -85,7 +86,16 @@ def _bootstrap(model_path: str):
         {k: v for k, v in config.transformer.items() if not k.startswith("_")}
     )
 
-    server_args = ServerArgs(model_path=str(paths.root))
+    server_args = ServerArgs(
+        model_path=str(paths.root),
+        num_gpus=num_gpus,
+        tp_size=tp_size,
+        sp_degree=sp_degree,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        cfg_parallel_degree=cfg_parallel_degree,
+        dp_size=dp_size,
+    )
     server_args.pipeline_config = pipeline_config
     # Offload defaults to on for the text encoder, and upstream relies on a
     # component residency manager to bring a component back before use. These
@@ -99,7 +109,7 @@ def _bootstrap(model_path: str):
 
 
 @lru_cache(maxsize=None)
-def _init_parallel() -> None:
+def _init_parallel(tp_rank, tp_size, device, nccl_port, tp_dit, sp_degree, ulysses_degree, ring_degree ) -> None:
     """Stand up one-process parallel groups, which sglang's DiT layers need.
 
     Its ColumnParallelLinear and USPAttention read the TP and SP groups while
@@ -109,9 +119,22 @@ def _init_parallel() -> None:
         maybe_init_distributed_environment_and_model_parallel,
     )
 
+    os.environ["RANK"] = str(tp_rank)
+    # sglang multimodal_gen places modules on npu:{LOCAL_RANK}, not on our device;
+    # drop once each stage process sees only its own card as index 0.
+    os.environ["LOCAL_RANK"] = str(device.index)
+    os.environ["WORLD_SIZE"] = str(tp_size)
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29511")
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    master_port = str(nccl_port) if nccl_port is not None else C.DEFAULT_MASTER_PORT
+    os.environ["MASTER_PORT"] = master_port
+
+    maybe_init_distributed_environment_and_model_parallel(
+        tp_size=tp_dit, 
+        sp_size=sp_degree, 
+        cfg_degree=1,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,    
+    )
 
 
 @lru_cache(maxsize=None)
@@ -123,8 +146,8 @@ def _load_component(model_path: str, name: str):
         PipelineComponentLoader,
     )
 
-    _init_parallel()
-    paths, _, server_args = _bootstrap(model_path)
+    paths = resolve_checkpoint(model_path)
+    server_args = get_global_server_args()
     library, architecture = load_json(paths.model_index)[name]
     module, _ = PipelineComponentLoader.load_component(
         component_name=name,
@@ -307,16 +330,66 @@ def create_dit_executor(
     num_inference_steps: int = C.DEFAULT_NUM_INFERENCE_STEPS,
     guidance_scale: float = C.DEFAULT_GUIDANCE_SCALE,
     max_concurrency: int = 1,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
+    sp_degree=1,
+    ulysses_degree=None,
+    ring_degree=1,
 ) -> SimpleScheduler:
     """Conditioning, DiT sampling and VAE decode of one request in one stage."""
     from sglang_omni.models.glm_image.diffusion import GLMImageDiffusion
 
     _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
-    # sglang multimodal_gen places modules on npu:{LOCAL_RANK}, not on our device;
-    # drop once each stage process sees only its own card as index 0.
-    os.environ["LOCAL_RANK"] = str(device.index)
-    _, _, server_args = _bootstrap(model_path)
+
+
+    
+    
+    if sp_degree > tp_size or tp_size % sp_degree != 0:
+        raise ValueError(
+            f"tp_size ({tp_size}) must be >= and divisible by sp_degree ({sp_degree})"
+        )
+
+    
+    
+    tp_dit = tp_size // sp_degree
+    ulysses_degree = sp_degree // ring_degree if ulysses_degree is None else ulysses_degree
+
+    if ulysses_degree * ring_degree != sp_degree:
+        raise ValueError(
+            f"sp_degree ({sp_degree}) must equal ring_degree {ring_degree} * ulysses_degree {ulysses_degree} "
+            )
+    
+    _init_parallel(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        tp_dit=tp_dit,
+        sp_degree=sp_degree,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        device=device,
+        nccl_port=nccl_port,
+    )
+    
+    _, _, server_args = _bootstrap(
+        model_path,
+        num_gpus=tp_size, 
+        tp_size= tp_dit, 
+        sp_degree=sp_degree, 
+        ulysses_degree=ulysses_degree, 
+        ring_degree=ring_degree, 
+        cfg_parallel_degree=1, 
+        dp_size=1
+    )
+
+    num_heads_text_enc = server_args.pipeline_config.text_encoder_configs[0].arch_config.num_heads
+    num_heads_dit = server_args.pipeline_config.dit_config.arch_config.num_attention_heads
+
+    if num_heads_text_enc % tp_dit != 0 or num_heads_dit % tp_dit != 0:
+        raise ValueError(
+            f"text_encoder's and dit's num heads {num_heads_text_enc}, {num_heads_dit} must be divisible by tp_size {tp_dit}"
+        )
 
     transformer = _load_component(model_path, "transformer")
     scheduler = _load_component(model_path, "scheduler")
