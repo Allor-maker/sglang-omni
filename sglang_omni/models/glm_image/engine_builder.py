@@ -92,10 +92,6 @@ class GLMImageEngineBuilder(SGLangGenerationEngineBuilder):
         )
 
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
-        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-
-        if not use_mlx():
-            return {}
         return {
             "enable_async_decode": True,
             "async_decode_min_batch_size": 1,
