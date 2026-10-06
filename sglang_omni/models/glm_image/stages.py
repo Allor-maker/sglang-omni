@@ -28,7 +28,6 @@ from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
-    GlmImageAR,
     GlmImageBeforeDenoisingStage,
     GlmImageDecodingStage,
 )
@@ -36,14 +35,12 @@ from sglang.multimodal_gen.runtime.server_args.server_args import (
     ServerArgs,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 from sglang_omni.models.glm_image import constants as C
 from sglang_omni.models.glm_image.config import DENOISING_STAGE
 from sglang_omni.models.glm_image.checkpoint import load_json, resolve_checkpoint
 from sglang_omni.models.glm_image.hf_config import make_runtime_config
 from sglang_omni.models.glm_image.payload_types import GLMImageState
-from sglang_omni.models.glm_image.request_builders import build_glm_image_state
 from sglang_omni.scheduling.pipeline_state import build_usage, load_state, store_state
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.device import resolve_concrete_device
@@ -119,15 +116,8 @@ def _init_parallel() -> None:
 
 @lru_cache(maxsize=None)
 def _load_component(model_path: str, name: str):
-    """Load one checkpoint component through sglang's own loader.
-
-    The library and class come from model_index.json, so the DiT resolves
-    through sglang's ModelRegistry rather than to the diffusers class: only
-    sglang's carries the rotary_emb and kv_caches interface DenoisingStage
-    drives. Cached per name, so stages sharing a process share the module --
-    the scheduler in particular must be one instance, because conditioning
-    configures its resolution-dependent sigma schedule and denoising reads it
-    back off the Req.
+    """
+    Load one checkpoint component through sglang's own loader.
     """
     from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
         PipelineComponentLoader,
@@ -217,9 +207,6 @@ _CARRIED_FIELDS = (
     "prior_token_drop_uncond",
 )
 
-# Resolution the AR stage aligned up; decode crops back to the requested one.
-_RESOLVED_FIELDS = ("width", "height", "requested_width", "requested_height")
-
 
 def _clear_carried(state: GLMImageState) -> GLMImageState:
     for name in _CARRIED_FIELDS:
@@ -260,15 +247,6 @@ def _to_req(
     return req
 
 
-def _from_req(req: Req, state: GLMImageState) -> GLMImageState:
-    """Copy back the fields the stage produced."""
-    for name in _CARRIED_FIELDS + _RESOLVED_FIELDS:
-        value = getattr(req, name, None)
-        if value is not None:
-            setattr(state, name, value)
-    return state
-
-
 def _record_usage(state: GLMImageState) -> GLMImageState:
     """Count tokens where they first appear, so no stage has to know its place.
 
@@ -286,38 +264,6 @@ def _record_usage(state: GLMImageState) -> GLMImageState:
         if embeds is not None and embeds.dim() >= 2:
             state.prompt_tokens = int(embeds.shape[-2])
     return state
-
-
-def _run(stage, server_args, device, build_state=None, **req_defaults):
-    """Wrap one sglang stage as an omni compute function.
-
-    ``req_defaults`` carries the stage's FactoryArgs knobs into the Req, which
-    is where the wrapped sglang logic reads them from. The entry stage passes
-    ``build_state``: nothing has written payload.data yet, so the request
-    itself is the only source of state.
-    """
-
-    stage_name = type(stage).__name__
-
-    @torch.inference_mode()
-    def compute(payload):
-        received = time.time()
-        with StageProfiler(stage_name, logger, metrics=None, log_stage_start_end=True):
-            if build_state is not None:
-                state = build_state(payload)
-                state.request_started_at = received
-            else:
-                state = load_state(payload, GLMImageState)
-            req = _to_req(state, device=device, **req_defaults)
-            # DenoisingStage reads batch.scheduler, not self.scheduler, and the
-            # instance carries the schedule conditioning configured on it.
-            scheduler = getattr(stage, "scheduler", None)
-            if scheduler is not None:
-                req.scheduler = scheduler
-            state = _from_req(stage.forward(req, server_args), state)
-        return store_state(payload, _record_usage(state))
-
-    return compute
 
 
 # ===== stage factories =====
@@ -352,15 +298,19 @@ def create_srt_ar_executor(
     )
 
 
-def create_hf_ar_executor(
+def create_dit_executor(
     model_path: str,
     *,
     device: str | None = None,
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
+    num_inference_steps: int = C.DEFAULT_NUM_INFERENCE_STEPS,
+    guidance_scale: float = C.DEFAULT_GUIDANCE_SCALE,
     max_concurrency: int = 1,
 ) -> SimpleScheduler:
-    """AR stage: the VLM turns the prompt into prior tokens."""
+    """Conditioning, DiT sampling and VAE decode of one request in one stage."""
+    from sglang_omni.models.glm_image.diffusion import GLMImageDiffusion
+
     _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
     # sglang multimodal_gen places modules on npu:{LOCAL_RANK}, not on our device;
@@ -368,99 +318,37 @@ def create_hf_ar_executor(
     os.environ["LOCAL_RANK"] = str(device.index)
     _, _, server_args = _bootstrap(model_path)
 
-    stage = GlmImageAR(
-        processor=_load_component(model_path, "processor"),
-        vision_language_encoder=_load_component(model_path, "vision_language_encoder"),
-    )
-    return SimpleScheduler(
-        _run(stage, server_args, device, build_state=build_glm_image_state),
-        max_concurrency=max_concurrency,
-    )
-
-
-def create_before_denoising_executor(
-    model_path: str,
-    *,
-    device: str | None = None,
-    gpu_id: int | None = None,
-    dtype: str = "bfloat16",
-    num_inference_steps: int = C.DEFAULT_NUM_INFERENCE_STEPS,
-    max_concurrency: int = 1,
-) -> SimpleScheduler:
-    """Conditioning stage: ByT5 glyph embeds, initial noise, timestep schedule."""
-    _resolve_dtype(field="dtype", name=dtype)
-    device = resolve_concrete_device(device, gpu_id)
-    os.environ["LOCAL_RANK"] = str(device.index)
-    _, _, server_args = _bootstrap(model_path)
-
-    stage = GlmImageBeforeDenoisingStage(
-        tokenizer=_load_component(model_path, "tokenizer"),
-        text_encoder=_load_component(model_path, "text_encoder"),
-        vae=_load_component(model_path, "vae"),
-        transformer=_load_component(model_path, "transformer"),
-        scheduler=_load_component(model_path, "scheduler"),
-    )
-
-    return SimpleScheduler(
-        _run(stage, server_args, device, num_inference_steps=num_inference_steps),
-        max_concurrency=max_concurrency,
-    )
-
-
-def create_denoising_executor(
-    model_path: str,
-    *,
-    device: str | None = None,
-    gpu_id: int | None = None,
-    dtype: str = "bfloat16",
-    guidance_scale: float = C.DEFAULT_GUIDANCE_SCALE,
-    max_concurrency: int = 1,
-) -> SimpleScheduler:
-    """Denoising stage: the DiT sampling loop with classifier-free guidance."""
-    _resolve_dtype(field="dtype", name=dtype)
-    device = resolve_concrete_device(device, gpu_id)
-    os.environ["LOCAL_RANK"] = str(device.index)
-    _, _, server_args = _bootstrap(model_path)
-
     transformer = _load_component(model_path, "transformer")
-    stage = _attach_residency(
-        DenoisingStage(
+    scheduler = _load_component(model_path, "scheduler")
+    vae = _load_component(model_path, "vae")
+    diffusion = GLMImageDiffusion(
+        before_denoising=GlmImageBeforeDenoisingStage(
+            tokenizer=_load_component(model_path, "tokenizer"),
+            text_encoder=_load_component(model_path, "text_encoder"),
+            vae=vae,
             transformer=transformer,
-            scheduler=_load_component(model_path, "scheduler"),
+            scheduler=scheduler,
         ),
-        DENOISING_STAGE,
-        server_args,
-        transformer=transformer,
+        denoising=_attach_residency(
+            DenoisingStage(transformer=transformer, scheduler=scheduler),
+            DENOISING_STAGE,
+            server_args,
+            transformer=transformer,
+        ),
+        decoding=GlmImageDecodingStage(vae=vae),
+        server_args=server_args,
     )
-    return SimpleScheduler(
-        _run(stage, server_args, device, guidance_scale=guidance_scale),
-        max_concurrency=max_concurrency,
-    )
-
-
-def create_decode_executor(
-    model_path: str,
-    *,
-    device: str | None = None,
-    gpu_id: int | None = None,
-    dtype: str = "bfloat16",
-    max_concurrency: int = 1,
-) -> SimpleScheduler:
-    """Decode stage: VAE decode, then crop back to the requested canvas."""
-    _resolve_dtype(field="dtype", name=dtype)
-    device = resolve_concrete_device(device, gpu_id)
-    os.environ["LOCAL_RANK"] = str(device.index)
-    _, _, server_args = _bootstrap(model_path)
-
-    stage = GlmImageDecodingStage(vae=_load_component(model_path, "vae"))
-
-    stage_name = type(stage).__name__
 
     @torch.inference_mode()
     def compute(payload):
-        with StageProfiler(stage_name, logger, metrics=None, log_stage_start_end=True):
-            state = load_state(payload, GLMImageState)
-            output_batch = stage.forward(_to_req(state, device=device), server_args)
+        state = load_state(payload, GLMImageState)
+        req = _to_req(
+            state,
+            device=device,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+        )
+        output_batch = diffusion.run(req)
         _record_usage(state)
         payload = store_state(payload, _clear_carried(state))
         payload.data.update(
