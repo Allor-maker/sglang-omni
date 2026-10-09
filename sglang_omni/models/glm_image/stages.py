@@ -79,7 +79,9 @@ def _bootstrap(
     )
 
     # CFG and data parallelism stay off: sglang would otherwise turn CFG
-    # parallel on by itself once num_gpus > 1.
+    # parallel on by itself once num_gpus > 1. Autocast is off for GLM-Image,
+    # but sglang resolves that from pipeline_config while constructing
+    # ServerArgs, and the config below is only attached afterwards.
     server_args = ServerArgs(
         model_path=str(paths.root),
         num_gpus=num_gpus,
@@ -89,6 +91,7 @@ def _bootstrap(
         ring_degree=ring_degree,
         cfg_parallel_degree=1,
         dp_size=1,
+        disable_autocast=True,
     )
     server_args.pipeline_config = pipeline_config
     # Offload defaults to on for the text encoder, and upstream relies on a
