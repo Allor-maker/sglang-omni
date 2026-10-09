@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-Image: AR prior tokens, conditioning, DiT sampling, and VAE decode."""
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import Field
 
@@ -20,8 +20,32 @@ _PKG = "sglang_omni.models.glm_image"
 
 GLM_IMAGE_AR = "glm_image_ar"
 GLM_IMAGE_DIT = "glm_image_dit"
-# Key of the denoising stage in sglang's component residency manager.
-DENOISING_STAGE = "denoising_stage"
+
+
+def _stage_gpu_set(stage: StageConfig) -> set[int]:
+    gpu = stage.gpu
+    if gpu is None:
+        return set()
+    return set(gpu) if isinstance(gpu, list) else {gpu}
+
+
+def _reject_shared_tp_gpus(stages: list[StageConfig]) -> None:
+    """
+    Refuse multi-rank AR and DiT stages placed on the same cards.
+    """
+    by_name = {stage.name: stage for stage in stages}
+    ar, dit = by_name.get(GLM_IMAGE_AR), by_name.get(GLM_IMAGE_DIT)
+    if ar is None or dit is None or ar.tp_size == 1 or dit.tp_size == 1:
+        return
+    shared = _stage_gpu_set(ar) & _stage_gpu_set(dit)
+    if shared:
+        raise ValueError(
+            f"{GLM_IMAGE_AR} (tp_size={ar.tp_size}) and {GLM_IMAGE_DIT} "
+            f"(tp_size={dit.tp_size}) share GPUs {sorted(shared)}. Two multi-rank "
+            "stages on the same cards deadlock at startup: each rank waits for its "
+            "peers inside the per-card startup lock the other stage holds. Place "
+            'them on disjoint cards or run one of them on a single rank.'
+        )
 
 
 def _dit_stages(*, process: str, gpu: int | list[int], tp_size: int = 1, sp_degree: int = 1) -> list[StageConfig]:
@@ -32,7 +56,6 @@ def _dit_stages(*, process: str, gpu: int | list[int], tp_size: int = 1, sp_degr
             factory_path=f"{_PKG}.stages.create_dit_executor",
             factory=FactoryArgs(
                 device=current_platform.device_type,
-                dtype="bfloat16",
                 num_inference_steps=C.DEFAULT_NUM_INFERENCE_STEPS,
                 guidance_scale=C.DEFAULT_GUIDANCE_SCALE,
                 max_concurrency=1,
@@ -96,6 +119,10 @@ class GLMImagePipelineConfig(PipelineConfig):
     }
 
     stages: list[StageConfig] = Field(default_factory=_dual_npu_stages)
+
+    def model_post_init(self, __context: Any = None) -> None:
+        super().model_post_init(__context)
+        _reject_shared_tp_gpus(self.stages)
 
 
 class GLMImageSingleNPUPipelineConfig(GLMImagePipelineConfig):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GLMImage checkpoint path and weight loading helpers."""
+"""GLM-Image checkpoint layout: per-component paths and JSON loading."""
 
 from __future__ import annotations
 

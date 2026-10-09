@@ -90,9 +90,4 @@ class GLMImageEngineBuilder(SGLangGenerationEngineBuilder):
             image_end_token_id=model.config.image_end_token_id,
             vocab_size=model.config.text_config.vision_vocab_size,
         )
-
-    def extra_scheduler_kwargs(self) -> dict[str, Any]:
-        return {
-            "enable_async_decode": True,
-            "async_decode_min_batch_size": 1,
-        }
+    
