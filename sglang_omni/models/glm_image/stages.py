@@ -17,9 +17,9 @@ import logging
 import os
 import time
 from functools import lru_cache
+from typing import Any
 
 import torch
-
 from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
@@ -32,8 +32,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.g
 )
 from sglang.multimodal_gen.runtime.server_args.server_args import (
     ServerArgs,
-    set_global_server_args,
     get_global_server_args,
+    set_global_server_args,
 )
 
 from sglang_omni.models.glm_image import constants as C
@@ -43,8 +43,6 @@ from sglang_omni.scheduling.pipeline_state import build_usage, load_state, store
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.device import resolve_concrete_device
 from sglang_omni.utils.image_payload import image_pixels_payload
-
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -137,11 +135,11 @@ def _init_parallel(
     os.environ["MASTER_PORT"] = master_port
 
     maybe_init_distributed_environment_and_model_parallel(
-        tp_size=tp_dit, 
-        sp_size=sp_degree, 
+        tp_size=tp_dit,
+        sp_size=sp_degree,
         cfg_degree=1,
         ulysses_degree=ulysses_degree,
-        ring_degree=ring_degree,    
+        ring_degree=ring_degree,
     )
 
 
@@ -252,9 +250,7 @@ def create_srt_ar_executor(
     nccl_port: int | None = None,
 ):
     """Returns OmniScheduler for the GLM-Image AR engine."""
-    from sglang_omni.models.glm_image.engine_builder import (
-        GLMImageEngineBuilder,
-    )
+    from sglang_omni.models.glm_image.engine_builder import GLMImageEngineBuilder
 
     return GLMImageEngineBuilder(
         max_concurrency=max_concurrency,
@@ -328,10 +324,12 @@ def create_dit_executor(
 
     # sglang applies tp_size to every TP-capable module, ByT5 included; it
     # falls back to a broken HF T5 when the heads do not split evenly.
-    num_heads_text_enc = (
-        server_args.pipeline_config.text_encoder_configs[0].arch_config.num_heads
+    num_heads_text_enc = server_args.pipeline_config.text_encoder_configs[
+        0
+    ].arch_config.num_heads
+    num_heads_dit = (
+        server_args.pipeline_config.dit_config.arch_config.num_attention_heads
     )
-    num_heads_dit = server_args.pipeline_config.dit_config.arch_config.num_attention_heads
     if num_heads_text_enc % tp_dit != 0 or num_heads_dit % tp_dit != 0:
         raise ValueError(
             f"DiT TP degree {tp_dit} must divide the text encoder's "

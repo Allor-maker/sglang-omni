@@ -1,28 +1,27 @@
-from sglang.srt.managers.schedule_batch import Req, MultimodalInputs
-from sglang.srt.sampling.sampling_params import SamplingParams
-
-from sglang.srt.multimodal.processors.glm_image import GlmImageProcessor
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import GlmImageAR
-from sglang.multimodal_gen.configs.sample.glmimage import align_glm_image_resolution
-
-from sglang_omni.proto import StagePayload
-
-from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
-from sglang_omni.scheduling.pipeline_state import store_state
-
-from sglang_omni.models.glm_image.request_builders import build_glm_image_state
-import sglang_omni.models.glm_image.constants as C
-
-import torch
+import logging
 from dataclasses import dataclass
 
-from sglang_omni.models.glm_image.payload_types import GLMImageState
+import torch
+from sglang.multimodal_gen.configs.sample.glmimage import align_glm_image_resolution
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
+    GlmImageAR,
+)
+from sglang.srt.managers.schedule_batch import MultimodalInputs, Req
+from sglang.srt.multimodal.processors.glm_image import GlmImageProcessor
+from sglang.srt.sampling.sampling_params import SamplingParams
 
-import logging
+import sglang_omni.models.glm_image.constants as C
+from sglang_omni.models.glm_image.payload_types import GLMImageState
+from sglang_omni.models.glm_image.request_builders import build_glm_image_state
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import store_state
+from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
+
 logger = logging.getLogger(__name__)
 
-from types import SimpleNamespace
 import time
+from types import SimpleNamespace
+
 
 @dataclass
 class GLMImageARRequestData(SGLangARRequestData):
@@ -30,20 +29,24 @@ class GLMImageARRequestData(SGLangARRequestData):
     generation_shape: tuple[int, int, int] | None = None
 
 
-def make_glm_image_ar_adapters(processor, image_start_token_id, image_end_token_id, vocab_size):
+def make_glm_image_ar_adapters(
+    processor, image_start_token_id, image_end_token_id, vocab_size
+):
 
     proc = SimpleNamespace(
-        IMAGE_START_TOKEN_ID=image_start_token_id,
-        IMAGE_END_TOKEN_ID=image_end_token_id
+        IMAGE_START_TOKEN_ID=image_start_token_id, IMAGE_END_TOKEN_ID=image_end_token_id
     )
 
     def request_builder(
-            payload: StagePayload,
-        )-> GLMImageARRequestData:
+        payload: StagePayload,
+    ) -> GLMImageARRequestData:
 
         state = build_glm_image_state(payload=payload)
         state.request_started_at = time.time()
-        requested_width, requested_height = state.requested_width, state.requested_height
+        requested_width, requested_height = (
+            state.requested_width,
+            state.requested_height,
+        )
         prompt = state.prompt
 
         width, height = align_glm_image_resolution(requested_width, requested_height)
@@ -81,10 +84,12 @@ def make_glm_image_ar_adapters(processor, image_start_token_id, image_end_token_
                 is_text_to_image=True,
             )
         )
-        mrope_positions, mrope_position_delta = GlmImageProcessor._compute_glm_image_mrope_positions(
-            proc,
-            input_ids=input_ids,
-            image_grid_thw=image_grid_thw,
+        mrope_positions, mrope_position_delta = (
+            GlmImageProcessor._compute_glm_image_mrope_positions(
+                proc,
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+            )
         )
 
         mm_inputs = MultimodalInputs(
@@ -110,12 +115,12 @@ def make_glm_image_ar_adapters(processor, image_start_token_id, image_end_token_
         req.multimodal_inputs = mm_inputs
 
         return GLMImageARRequestData(
-                state=state,
-                stage_payload=payload,
-                req=req,
-                input_ids=input_ids,
-                generation_shape=(large_image_offset, token_h, token_w),
-            )
+            state=state,
+            stage_payload=payload,
+            req=req,
+            input_ids=input_ids,
+            generation_shape=(large_image_offset, token_h, token_w),
+        )
 
     def result_adapter(data):
         state = data.state
@@ -137,15 +142,17 @@ def make_glm_image_ar_adapters(processor, image_start_token_id, image_end_token_
             dtype=torch.long,
         )
 
-        state.prior_token_id = GlmImageAR._upsample_token_ids(prior_token_ids_d32, token_h, token_w)
+        state.prior_token_id = GlmImageAR._upsample_token_ids(
+            prior_token_ids_d32, token_h, token_w
+        )
 
         state.prompt_tokens = len(data.input_ids)
         state.completion_tokens = actual_output_len
-        logger.info("[GlmImageAR] finished in %.4f seconds", time.time() - state.request_started_at)
+        logger.info(
+            "[GlmImageAR] finished in %.4f seconds",
+            time.time() - state.request_started_at,
+        )
 
         return store_state(payload, state)
-    
-
 
     return (request_builder, result_adapter)
-    

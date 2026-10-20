@@ -46,10 +46,11 @@ def resolve_checkpoint(model_path: str | Path) -> CheckpointPaths:
         processor=root / "processor",
         transformer=root / "transformer",
         scheduler=root / "scheduler",
-        model_index=root / "model_index.json"
+        model_index=root / "model_index.json",
     )
 
     return paths
+
 
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
@@ -57,8 +58,6 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"expected JSON object in {path}")
     return value
-
-
 
 
 __all__ = [

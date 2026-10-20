@@ -44,11 +44,13 @@ def _reject_shared_tp_gpus(stages: list[StageConfig]) -> None:
             f"(tp_size={dit.tp_size}) share GPUs {sorted(shared)}. Two multi-rank "
             "stages on the same cards deadlock at startup: each rank waits for its "
             "peers inside the per-card startup lock the other stage holds. Place "
-            'them on disjoint cards or run one of them on a single rank.'
+            "them on disjoint cards or run one of them on a single rank."
         )
 
 
-def _dit_stages(*, process: str, gpu: int | list[int], tp_size: int = 1, sp_degree: int = 1) -> list[StageConfig]:
+def _dit_stages(
+    *, process: str, gpu: int | list[int], tp_size: int = 1, sp_degree: int = 1
+) -> list[StageConfig]:
     return [
         StageConfig(
             name=GLM_IMAGE_DIT,
@@ -71,7 +73,11 @@ def _dit_stages(*, process: str, gpu: int | list[int], tp_size: int = 1, sp_degr
 
 
 def _srt_stages(
-    *, ar_gpus: list[int], dit_gpus: list[int], dit_sp_degree: int = 1, kv_cache_bytes: str | None = None
+    *,
+    ar_gpus: list[int],
+    dit_gpus: list[int],
+    dit_sp_degree: int = 1,
+    kv_cache_bytes: str | None = None,
 ) -> list[StageConfig]:
     # The srt engine sets up its own torch.distributed world, and the DiT stack
     # sets up another in _init_parallel; separate processes keep them apart.
@@ -86,15 +92,15 @@ def _srt_stages(
                 max_concurrency=1,
             ),
             engine=EngineArgs(kv_cache_bytes=kv_cache_bytes),
-            tp_size = len(ar_gpus),
+            tp_size=len(ar_gpus),
             gpu=ar_gpus,
             next=GLM_IMAGE_DIT,
         ),
         *_dit_stages(
-            process="glm_image_dit", 
-            tp_size=len(dit_gpus), 
-            gpu=dit_gpus, 
-            sp_degree=dit_sp_degree
+            process="glm_image_dit",
+            tp_size=len(dit_gpus),
+            gpu=dit_gpus,
+            sp_degree=dit_sp_degree,
         ),
     ]
 
